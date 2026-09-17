@@ -9,7 +9,7 @@ from app.graph.nodes import NOT_IN_CORPUS_ANSWER
 from app.llm.service import NOT_IN_CORPUS_SENTINEL
 from app.main import app
 from app.vectorstore.pinecone import PineconeVectorStore
-from tests.fakes import FakeLLMs, FakeStore, build_test_graph, make_chunk
+from tests.fakes import FakeLLMs, FakeRetrievalService, build_test_graph, make_chunk
 
 ACME_CHUNKS = [
     make_chunk("Asana offers list and board project views.", "acme", "asana-1", brand="Asana"),
@@ -63,10 +63,28 @@ def test_hybrid_search_scopes_query_to_tenant() -> None:
     assert "vector" in kwargs and "sparse_vector" in kwargs
 
 
+def test_dense_search_scopes_query_to_tenant() -> None:
+    index = _FakeIndex()
+    store = PineconeVectorStore(
+        client=object(),
+        index=index,
+        sparse_encoder=_FakeSparseEncoder(),
+        alpha=0.5,
+    )
+
+    asyncio.run(store.dense_search([0.1, 0.2, 0.3, 0.4], "acme", limit=7))
+
+    kwargs = index.queries[0]
+    assert kwargs["namespace"] == "acme"
+    assert kwargs["filter"] == {"tenant_id": {"$eq": "acme"}}
+    assert kwargs["top_k"] == 7
+    assert "vector" in kwargs and "sparse_vector" not in kwargs
+
+
 def test_graph_only_retrieves_scoped_tenant_and_never_leaks() -> None:
-    store = FakeStore({"acme": ACME_CHUNKS, "beta": BETA_CHUNKS})
+    retrieval = FakeRetrievalService({"acme": ACME_CHUNKS, "beta": BETA_CHUNKS})
     llms = FakeLLMs(relevant_by_call=[[0], [1]])
-    graph = build_test_graph(store, llms)
+    graph = build_test_graph(retrieval, llms)
 
     acme = asyncio.run(
         graph.ainvoke(
@@ -99,7 +117,7 @@ def test_graph_only_retrieves_scoped_tenant_and_never_leaks() -> None:
         )
     )
 
-    assert [q["tenant_id"] for q in store.queries] == ["acme", "beta"]
+    assert [q["tenant_id"] for q in retrieval.queries] == ["acme", "beta"]
     assert {c.metadata["tenant_id"] for c in acme["relevant_chunks"]} == {"acme"}
     assert {c.metadata["tenant_id"] for c in beta["relevant_chunks"]} == {"beta"}
     assert acme["relevant_chunks"][0].metadata["brand"] == "Asana"
@@ -108,12 +126,12 @@ def test_graph_only_retrieves_scoped_tenant_and_never_leaks() -> None:
 
 @pytest.fixture()
 def client() -> None:
-    store = FakeStore({"acme": ACME_CHUNKS, "beta": BETA_CHUNKS})
+    retrieval = FakeRetrievalService({"acme": ACME_CHUNKS, "beta": BETA_CHUNKS})
     llms = FakeLLMs(relevant_by_call=[[0], [0]])
-    graph = build_test_graph(store, llms)
+    graph = build_test_graph(retrieval, llms)
     app.dependency_overrides[get_ask_graph] = lambda: graph
     with TestClient(app) as test_client:
-        test_client.store = store  # type: ignore[attr-defined]
+        test_client.retrieval = retrieval  # type: ignore[attr-defined]
         yield test_client
     app.dependency_overrides.pop(get_ask_graph, None)
 
@@ -132,7 +150,7 @@ def test_ask_route_uses_path_tenant_and_returns_citations(client: TestClient) ->
     assert beta.status_code == 200
     assert beta.json()["citations"][0]["brand"] == "Trello"
 
-    assert [q["tenant_id"] for q in client.store.queries] == ["acme", "beta"]  # type: ignore[attr-defined]
+    assert [q["tenant_id"] for q in client.retrieval.queries] == ["acme", "beta"]  # type: ignore[attr-defined]
 
 
 def test_ask_rejects_empty_question(client: TestClient) -> None:
@@ -150,9 +168,9 @@ def test_ask_empty_tenant_returns_not_in_corpus(client: TestClient) -> None:
 
 
 def test_ask_citations_empty_when_generator_declines() -> None:
-    store = FakeStore({"acme": ACME_CHUNKS})
+    retrieval = FakeRetrievalService({"acme": ACME_CHUNKS})
     llms = FakeLLMs(relevant_by_call=[[0]], answer=NOT_IN_CORPUS_SENTINEL)
-    graph = build_test_graph(store, llms)
+    graph = build_test_graph(retrieval, llms)
     app.dependency_overrides[get_ask_graph] = lambda: graph
     try:
         with TestClient(app) as test_client:

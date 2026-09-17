@@ -11,7 +11,7 @@ The implementation follows the project requirements:
 - Ollama `qwen3-embedding:4b` dense embeddings (via `langchain-ollama`)
 - BM25 sparse retrieval
 - Pinecone vector storage (serverless, hybrid dense + BM25 in one index)
-- Hybrid retrieval via `alpha` query weighting (no RRF)
+- Hybrid retrieval via true RRF over dense (Pinecone) + tenant-local BM25
 - `cross-encoder/ms-marco-MiniLM-L6-v2` reranking
 - LangGraph-based question answering agent
 - FastAPI REST API
@@ -79,7 +79,9 @@ brand-qa-agent/
 │   ├── retrieval/
 │   │   ├── __init__.py
 │   │   ├── bm25.py
-│   │   ├── hybrid.py
+│   │   ├── bm25_index.py
+│   │   ├── fusion.py
+│   │   ├── service.py
 │   │   └── reranker.py
 │   │
 │   ├── llm/
@@ -1072,16 +1074,18 @@ delete_document(tenant_id, doc_id)
 count(tenant_id=None) -> int
 dense_search(query_vector, tenant_id, limit)
 sparse_search(query_vector, tenant_id, limit)
-hybrid_search(query_vector, sparse_vector, tenant_id, limit, alpha)  # single query
+hybrid_search(query_vector, sparse_vector, tenant_id, limit, alpha)
 embed_query(text)
 encode_query(text)
 ```
 
+The store exposes all three query modes. The **ask path** uses `dense_search`
+(`dense/`) plus a per-tenant local `BM25Index` (`sparse/`) as two independent
+retrievers, fused with RRF in `app/retrieval/service.py` (Section 12).
 `hybrid_search` scales the two query vectors with
-`pinecone_text.hybrid.hybrid_convex_scale` (convex `alpha` combination) and
-sends ONE `index.query(vector=..., sparse_vector=...)` request. No client-side
-fusion is required — Pinecone dot-products the weighted dense and sparse query
-vectors against each stored record.
+`pinecone_text.hybrid.hybrid_convex_scale` (convex `alpha` combination) in ONE
+`index.query(vector=..., sparse_vector=...)` request; it remains available at
+the store layer but is not on the ask path.
 
 ### Tenant isolation
 
@@ -1100,45 +1104,52 @@ The vector database itself must enforce the isolation.
 
 # 12. Hybrid Retrieval
 
-## `app/retrieval/hybrid.py`
+## `app/retrieval/fusion.py` + `app/retrieval/bm25_index.py` + `app/retrieval/service.py`
 
 ### Responsibility
 
-Turn a `question` into a single hybrid query and return the winning chunks for
-one tenant.
+Turn a `question` into ranked candidate chunks for one tenant by fusing two
+independent retrievers — Pinecone dense search and a per-tenant in-memory BM25
+index — with Reciprocal Rank Fusion, then handing the fused set to the reranker.
 
 ### Pipeline
 
 ```text
-question
+question (tenant-scoped)
    │
-   ├────────────────┐
-   ↓                ↓
-dense (Ollama)   BM25 (Bm25SparseVectorizer)
-   │                │
-   └───┬────────────┘
-       ↓
- hybrid_convex_scale(dense, sparse, alpha)
-       ↓
- Pinecone index.query(vector, sparse_vector)   # one request
-       ↓
-candidate set (HYBRID_TOP_K)
+   ├────────────────────┐
+   ▼                    ▼
+Pinecone dense      BM25Index (local, per tenant, rank_bm25)
+(query embedding)   (query tokens)
+   ▼                    ▼
+top-10 {id,score}   top-10 {id,score}
+   │                    │
+   └────────┬───────────┘
+            ▼
+   reciprocal_rank_fusion(k=60)   # rank-based: 1/(k + rank) per retriever
+            ▼
+   top-10 fused candidates
+            ▼
+   Reranker (Section 13)
 ```
 
 ### Candidate counts
 
 ```text
-HYBRID_TOP_K=10   # initial candidates handed to the reranker
-FINAL_TOP_K=5      # post-rerank context used by the answer node
+per-retriever top_k = HYBRID_TOP_K = 10
+RRF constant k = 60
+FINAL_TOP_K = 5      # post-rerank context used by the answer node
 ```
 
 ### Fusion
 
-No RRF. Dense and BM25 scores live on incomparable scales (cosine-normed dense
-in `[-1, 1]` vs unbounded BM25), so the store applies a convex combination on
-the query vectors before the (already scaled for dotproduct) server-side score:
-`score = alpha * dense + (1 - alpha) * sparse`, with `alpha = PINECONE_ALPHA`
-(0.5 default).
+True Reciprocal Rank Fusion (`fusion.py:7`): a candidate's fused score is
+`Σ over retrievers of 1/(k + rank)`. Rank-based fusion sidesteps the
+incomparable score scales of dense (cosine-normed, in `[-1, 1]`) vs BM25
+(unbounded): a document found by **both** retrievers reliably outranks one
+found by only one. Chunk ids (`{doc_id}-{chunk_index}`) are the fusion key and
+exactly match the Pinecone vector id; deduplication keeps the highest-fused id
+and payloads come from the first retriever that returned it.
 
 ### Output
 
@@ -1146,13 +1157,11 @@ Return ranked candidate chunks with metadata.
 
 ### Tenant isolation
 
-The retriever receives:
-
-```text
-tenant_id
-```
-
-and passes it into every store call (namespace + metadata filter).
+The service receives `tenant_id` and threads it through **both** branches:
+Pinecone dense search uses `namespace = tenant_id` plus the `tenant_id`
+metadata filter, and `BM25Index.retrieve(tenant_id, ...)` scores only that
+tenant's own in-memory corpus — a tenant's query can never touch another
+tenant's lexical index.
 
 ---
 
@@ -1175,7 +1184,8 @@ ranking task (~80 MB, 22.7M params, Apache-2.0). Downloads once on first run
 and is loaded through `sentence_transformers.CrossEncoder`.
 
 Over-retrieve `fetch_k = HYBRID_TOP_K` (10), then keep `top_k = FINAL_TOP_K`
-(5) after reranking — the same fetch_k/top_k 10/5 split as the hybrid search.
+(5) after reranking — the same fetch_k/top_k 10/5 split as the fused dense +
+BM25 retrieval.
 
 ### Input
 
@@ -1746,15 +1756,18 @@ torch
 ```text
 pinecone
 pinecone-text
+rank-bm25
 nltk
 ```
 
-`pinecone_text` is used for `hybrid_convex_scale` and remains the source of the
-optional `BM25Encoder`. The default sparse encoder is the fit-free
-`Bm25SparseVectorizer`, so NLTK corpora are **not** required for normal
-operation; the start script still downloads `stopwords`, `punkt_tab`, and
-`snowball_data` so the injectable `BM25Encoder` alternative works if selected.
-`nltk` is pinned explicitly so the install step is reproducible.
+`pinecone_text` remains the source of the optional `BM25Encoder`
+(`hybrid_convex_scale` is now only exercised by the retained store-level
+`hybrid_search`, not the ask path). `rank-bm25` powers the per-tenant local
+BM25 index fused with RRF (Section 12). The default sparse encoder is the
+fit-free `Bm25SparseVectorizer`, so NLTK corpora are **not** required for
+normal operation; the start script still downloads `stopwords`, `punkt_tab`,
+and `snowball_data` so the injectable `BM25Encoder` alternative works if
+selected. `nltk` is pinned explicitly so the install step is reproducible.
 
 ### Extraction
 
@@ -1873,7 +1886,7 @@ Why the system uses:
 
 ```text
 qwen3-embedding:4b (Ollama)
-BM25 (Pinecone hybrid, alpha-weighted)
+BM25 (per-tenant local BM25 index, fused with dense by RRF)
 Pinecone (dense + sparse, namespace-per-tenant)
 cross-encoder/ms-marco-MiniLM-L6-v2
 LangGraph
@@ -1944,11 +1957,11 @@ RETRIEVE
 
         ↓
 
-Hybrid Retrieval
+Dense + per-tenant BM25 → RRF fusion
 
         ↓
 
-Hybrid candidates
+Fused candidates
         ↓
 
 Reranker
@@ -2074,23 +2087,25 @@ Implement in this exact order:
 12. embeddings/service.py
 13. vectorstore/pinecone.py
 14. retrieval/bm25.py
-15. retrieval/hybrid.py
-16. retrieval/reranker.py
-17. llm/service.py
-18. ingestion/service.py
-19. graph/state.py
-20. graph/nodes.py
-21. graph/edges.py
-22. graph/graph.py
-23. api/schemas.py
-24. api/routes/health.py
-25. api/routes/ingest.py
-26. api/routes/ask.py
-27. dependencies.py
-28. main.py
-29. tests/conftest.py
-30. test_tenant_isolation.py
-31. test_agent_decision.py
+15. retrieval/bm25_index.py
+16. retrieval/fusion.py
+17. retrieval/service.py
+18. retrieval/reranker.py
+19. llm/service.py
+20. ingestion/service.py
+21. graph/state.py
+22. graph/nodes.py
+23. graph/edges.py
+24. graph/graph.py
+25. api/schemas.py
+26. api/routes/health.py
+27. api/routes/ingest.py
+28. api/routes/ask.py
+29. dependencies.py
+30. main.py
+31. tests/conftest.py
+32. test_tenant_isolation.py
+33. test_agent_decision.py
 32. seed_corpus.py
 33. Dockerfile
 34. docker-compose.yml
@@ -2125,10 +2140,10 @@ The backend is considered functionally complete when:
 
 - [ ] Dense retrieval works.
 - [ ] BM25 sparse retrieval works.
-- [ ] Pinecone hybrid search (alpha-weighted) works.
+- [ ] RRF fusion over dense + per-tenant BM25 works.
 - [ ] Reranking works.
 - [ ] Final context is limited to approximately top 5 chunks.
-- [ ] Tenant filter is applied during retrieval (namespace + metadata filter).
+- [ ] Tenant filter is applied during retrieval (namespace + metadata filter, and a per-tenant BM25 corpus).
 
 ### Agent
 

@@ -78,7 +78,7 @@ All configuration is read from environment variables (`.env`); no keys are commi
 | `PINECONE_API_KEY` | — | Pinecone credentials |
 | `PINECONE_INDEX` | `brand-chunks` | Index name |
 | `PINECONE_CLOUD` / `PINECONE_REGION` | `aws` / `us-east-1` | Serverless spec |
-| `PINECONE_ALPHA` | `0.5` | Hybrid dense weight (1.0 = dense only, 0.0 = sparse only) |
+| `PINECONE_ALPHA` | `0.5` | Dense weight for the retained store-level hybrid search (not the ask path, which uses RRF) |
 | `EMBEDDING_MODEL` | `qwen3-embedding:4b` | Ollama embedding model |
 | `EMBEDDING_DIMENSION` | `1024` | Must match the Pinecone index |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
@@ -104,7 +104,7 @@ All configuration is read from environment variables (`.env`); no keys are commi
                               v
                     LangGraph StateGraph
                               |
-                    retrieve  (hybrid search, top 10)
+                    retrieve  (dense + tenant-BM25 → RRF, top 10)
                               |
                      grade    (LLM, structured yes/no)
                               |
@@ -153,7 +153,10 @@ app/
     document_chunker.py       chunk + attach metadata
   embeddings/service.py       Ollama embeddings (L2-normalized)
   retrieval/
-    bm25.py                   fit-free BM25 sparse vectorizer
+    bm25.py                   fit-free BM25 sparse vectorizer (store records)
+    bm25_index.py             per-tenant in-memory rank_bm25 index (ask path)
+    fusion.py                 reciprocal_rank_fusion (k=60)
+    service.py                RetrievalService: dense + BM25 → RRF → rerank
     reranker.py               cross-encoder reranker
   vectorstore/pinecone.py     hybrid upsert / query, namespace + metadata filter
   llm/service.py              Groq/OpenAI chat models, grader/rewriter/generator
@@ -247,11 +250,13 @@ Django/DRF would add an ORM and admin layer this service has no use for.
 
 ### Q2 — Which vector database, and what trade-off? (B.1, B.3)
 
-**Pinecone (serverless).** The free tier is enough, and it gives us three things in one
-place: per-tenant **namespaces**, a serverless index, and **native hybrid search** (dense +
-sparse) in a single query. The trade-off is a managed-service dependency with no local
-emulation; Chroma/Qdrant would run locally for free but would not provide the same
-namespace/hybrid story out of the box.
+**Pinecone (serverless).** The free tier is enough, and it gives us per-tenant **namespaces**
+and a serverless index out of the box. Retrieval fuses two independent branches — Pinecone
+**dense search** and a per-tenant in-memory **BM25** index — with **Reciprocal Rank Fusion**
+(`app/retrieval/fusion.py`), then a cross-encoder reranks before the LLM grader sees the
+candidates. The trade-off is a managed-service dependency with no local emulation;
+Chroma/Qdrant would run locally for free but would not provide the same namespace story out
+of the box.
 
 ### Q3 — Which LLM and embedding provider, and why? (B.1)
 
@@ -295,8 +300,8 @@ entry instead of overwriting the list.
 
 **Nodes:**
 
-- `retrieve` — embeds `active_query`, runs the hybrid search scoped to the tenant, reranks,
-  and stores the survivors in `retrieved_chunks`.
+- `retrieve` — runs dense (Pinecone, namespace-scoped) and tenant-local BM25 retrievers,
+  fuses them with RRF, reranks, and stores the top 5 survivors in `retrieved_chunks`.
 - `grade` — asks the LLM (structured output) which chunks actually help answer the question;
   the "yes" chunks go into `relevant_chunks`.
 - `rewrite` — asks the LLM to rephrase the question, increments `retry_count`, then loops
@@ -325,7 +330,8 @@ response returns.
 1. One Pinecone **namespace per `tenant_id`** on upsert and query.
 2. A `tenant_id` **metadata filter** (`{"tenant_id": {"$eq": tenant_id}}`) on every query.
 
-`tenant_id` always comes from the URL path; it is never defaulted and never taken from the
+plus a third, on the lexical branch: the in-memory **BM25 index is per-tenant**, so a tenant's
+query can never even score another tenant's corpus. `tenant_id` always comes from the URL path; it is never defaulted and never taken from the
 request body. Namespacing alone would isolate data; the metadata filter is a second lock so
 a mis-scoped namespace can still not leak another tenant's chunks. This is directly covered
 by `tests/test_tenant_isolation.py`.
@@ -364,7 +370,7 @@ Run them with:
 venv/bin/python -m pytest -q
 ```
 
-The full suite is **95 tests**; the two required ones are the files above.
+The full suite is **114 tests**; the two required ones are the files above.
 
 ### Q11 — How does the finished service behave on the three examples? (A.4)
 
@@ -382,24 +388,28 @@ The full suite is **95 tests**; the two required ones are the files above.
 ## 7. Tests
 
 ```bash
-venv/bin/python -m pytest -q          # 95 tests, LLM mocked
+venv/bin/python -m pytest -q          # 114 tests, LLM mocked
 ```
 
 Coverage includes ingestion (validation, per-document errors, idempotency), chunking and
-metadata, embeddings, BM25 sparse vectorization, the Pinecone store (hybrid search, tenant
-filtering, persistence), the reranker, the graph decision logic, and the API routes.
+metadata, embeddings, BM25 sparse vectorization, the Pinecone store (dense/hybrid search,
+tenant filtering, persistence), RRF fusion, the per-tenant BM25 index, the retrieval service,
+the reranker, the graph decision logic, and the API routes.
 
 ---
 
 ## 8. Reflection: trade-offs, rough edges, next steps (D.1.8)
 
-**One trade-off.** I used Pinecone's **native hybrid search** (`hybrid_convex_scale`,
-`alpha=0.5`) rather than running dense and BM25 as two separate retrievals and fusing them
-with Reciprocal Rank Fusion (RRF). Native hybrid is one round trip, less code, and lets
-Pinecone do the fusion — at the cost of direct control over (and inspectability of) the
-fusion step. The sparse encoder itself is a dependency-free `Bm25SparseVectorizer` (stable
-24-bit hash term ids) rather than a fitted `BM25Encoder`, so it needs no global vocabulary
-and no NLTK download at runtime.
+**One trade-off.** Dense and BM25 scores live on incomparable scales (cosine-normed dense in
+`[-1,1]` vs unbounded BM25), so the ask path does not mix raw scores: it fuses the two
+retrievers with **Reciprocal Rank Fusion** (`app/retrieval/fusion.py`, `k=60`), where each
+retriever contributes only a rank (`1/(k + rank)`) and a chunk found by both retrievers wins
+over one found by only one. The in-memory per-tenant BM25 index (`rank_bm25`) is rebuilt
+lazily and rehydrated from Pinecone at startup, so a fresh process answers correctly without
+waiting for new ingests. The retained store-level `hybrid_search` (`hybrid_convex_scale`,
+`alpha=0.5`) is available but not on the ask path. The sparse encoder for stored records is a
+dependency-free `Bm25SparseVectorizer` (stable 24-bit hash term ids) rather than a fitted
+`BM25Encoder`, so it needs no global vocabulary and no NLTK download at runtime.
 
 **One rough edge.** Chunking is character-based (400/50) rather than token-based, so chunk
 boundaries do not correspond to any model's tokenizer. `found_in_corpus` has two gates — the
@@ -409,6 +419,5 @@ occasionally mark a weak chunk as relevant, so a re-calibrated grader would tigh
 further.
 
 **One thing I would do with more time.** Add token-aware chunking (e.g. the Qwen tokenizer),
-a stronger/re-calibrated grader, and true RRF over separate dense and sparse retrievers so
-fusion is tunable and observable. Streaming the answer and adding per-tenant corpus manifests
-for reproducible seeding would be next.
+a stronger/re-calibrated grader, and per-tenant BM25 score calibration. Streaming the answer
+and adding per-tenant corpus manifests for reproducible seeding would be next.

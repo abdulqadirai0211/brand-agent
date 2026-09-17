@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Awaitable, Callable
 
 from langchain_core.documents import Document
 
-from app.config import get_settings
 from app.llm.service import NOT_IN_CORPUS_SENTINEL, Generator, Grader, Rewriter
-from app.retrieval.reranker import RerankingRetriever
-from app.vectorstore.pinecone import PineconeVectorStore, ScoredChunk
+from app.retrieval.service import RetrievalService
 
 Node = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -19,34 +16,19 @@ NOT_IN_CORPUS_ANSWER = (
 
 
 def create_nodes(
-    store: PineconeVectorStore,
-    retriever: RerankingRetriever,
+    retrieval_service: RetrievalService,
     grader: Grader,
     rewriter: Rewriter,
     generator: Generator,
 ) -> dict[str, Node]:
     """Build the graph's node set around injected dependencies (testable)."""
 
-    settings = get_settings()
-
     async def retrieve(state: dict[str, Any]) -> dict[str, Any]:
         query = state.get("active_query") or state["question"]
-        vector = await store.embed_query(query)
-        sparse = await asyncio.to_thread(store.encode_query, query)
-        candidates: list[ScoredChunk] = await store.hybrid_search(
-            vector,
-            sparse,
-            state["tenant_id"],
-            limit=settings.hybrid_top_k,
-        )
-        ranked = (
-            await asyncio.to_thread(retriever.rerank, query, candidates)
-            if candidates
-            else []
-        )
+        results = await retrieval_service.retrieve(state["tenant_id"], query)
         docs = [
             Document(page_content=item["payload"].get("text", ""), metadata=item["payload"])
-            for item in ranked
+            for item in results
         ]
         return {
             "active_query": query,

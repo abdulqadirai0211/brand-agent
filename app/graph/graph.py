@@ -9,13 +9,11 @@ from app.graph.edges import route_after_grade
 from app.graph.nodes import create_nodes
 from app.graph.state import QAState
 from app.llm.service import build_generator, build_grader, build_rewriter, get_chat_model
-from app.retrieval.reranker import RerankingRetriever
-from app.vectorstore.pinecone import PineconeVectorStore
+from app.retrieval.service import RetrievalService
 
 
 def build_ask_graph(
-    store: PineconeVectorStore,
-    retriever: RerankingRetriever | None = None,
+    retrieval_service: RetrievalService,
     *,
     grader: Any | None = None,
     rewriter: Any | None = None,
@@ -25,15 +23,13 @@ def build_ask_graph(
 
     ``retrieve -> grade -> (answer | rewrite -> retrieve -> grade -> answer | not_in_corpus)``
     """
-    retriever = retriever or RerankingRetriever.from_settings()
     needs_chat = grader is None or rewriter is None or generator is None
     if needs_chat:
         chat = get_chat_model()  # raises LLMUnconfiguredError; caught by the route
     else:
         chat = None
     nodes = create_nodes(
-        store,
-        retriever,
+        retrieval_service,
         grader=grader
         or build_grader(chat, method=get_settings().llm_structured_output_method),
         rewriter=rewriter or build_rewriter(chat),

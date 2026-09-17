@@ -13,7 +13,7 @@ body: { question }
    │    retrieved_chunks = [], relevant_chunks = [], retry_count = 0,
    │    answer = "", found_in_corpus = False, trace = []
    ▼
-┌──────────────────────── LangGraph (compiled)  graph.py:16 ──────────────────────┐
+┌──────────────────────── LangGraph (compiled)  graph.py:15 ──────────────────────┐
 │                                                                                 │
 │   START ──► retrieve ──► grade ──►(route_after_grade)  edges.py:8               │
 │                             │            │                                      │
@@ -32,19 +32,32 @@ AskResponse { answer, found_in_corpus, citations[], trace[] }
 ## 2. Retrieval pipeline (inside the `retrieve` node)
 
 ```
-retrieve node   nodes.py:32
-  query = state["active_query"]        # original question, or the rewritten query after a retry
-  │
-  ├─ dense  : store.embed_query(query)  → Ollama qwen3-embedding:4b → 1024-d, L2-normalized
-  ├─ sparse : to_thread(store.encode_query) → Bm25SparseVectorizer (TF, hashed 24-bit term ids)
+retrieve node                                                          nodes.py:26
+  query     = state["active_query"]   # original question, or the rewritten query after a retry
+  tenant_id = state["tenant_id"]      # scopes every branch of retrieval
   │
   ▼
-  store.hybrid_search(vector, sparse, tenant_id, limit=hybrid_top_k=10)   pinecone.py:200
-  │     _query():                                                        pinecone.py:219
-  │        namespace   = tenant_id                                        ◄── ISOLATION
-  │        filter      = { "tenant_id": { "$eq": tenant_id } }            ◄── ISOLATION (defense in depth)
-  │        hybrid_convex_scale(vector, sparse, alpha=0.5)   ← weighted sum, NOT true RRF
-  │        → top 10 candidates { id, score, payload(metadata + text) }
+  RetrievalService.retrieve(tenant_id, query)                          service.py:39
+  │
+  ├─ DENSE branch ───────────────────────────────────────────────────────────────
+  │   store.embed_query(query) → Ollama qwen3-embedding:4b → 1024-d, L2-normalized
+  │   store.dense_search(vector, tenant_id, limit=dense_top_k=10)      pinecone.py:190
+  │       _query()                                                     pinecone.py:219
+  │          namespace = tenant_id                                       ◄── ISOLATION
+  │          filter    = { "tenant_id": { "$eq": tenant_id } }           ◄── ISOLATION
+  │       → top 10 semantic candidates { id, score, payload(metadata + text) }
+  │
+  ├─ SPARSE branch ──────────────────────────────────────────────────────────────
+  │   BM25Index.retrieve(tenant_id, query, top_k=bm25_top_k=10)         bm25_index.py:52
+  │       rank_bm25.BM25Okapi, per-tenant in-memory lexical index
+  │       (fed at ingest; rebuilt lazily; rehydrated from Pinecone at startup)
+  │       → top 10 lexical candidates, same id scheme
+  │         id = "{doc_id}-{chunk_index}"  == Pinecone vector id
+  │
+  ▼
+  reciprocal_rank_fusion([dense, bm25], k=60)                           fusion.py:7
+  │     fused(id) = Σ_retrievers  1 / (k + rank + 1)     # rank is 1-based
+  │     de-dupe matches (highest fused score wins) → cap at dense_top_k=10
   ▼
   RerankingRetriever.rerank(query, candidates)                          reranker.py:42
   │     cross-encoder/ms-marco-MiniLM-L6-v2
@@ -56,7 +69,7 @@ retrieve node   nodes.py:32
 
 ## 3. Graph topology and state
 
-**Edges** (`graph.py:43-59`)
+**Edges** (`graph.py:42-55`)
 
 | From | To | Kind |
 |---|---|---|
@@ -93,7 +106,7 @@ else                          → "not_in_corpus"
 
 | Node | Reads | Does | Writes | Trace entry |
 |---|---|---|---|---|
-| `retrieve` (`nodes.py:32`) | `active_query`, `tenant_id` | dense + sparse query → hybrid top-10 → cross-encoder rerank → top-5 | `retrieved_chunks` | `retrieved N chunk(s)` |
+| `retrieve` (`nodes.py:26`) | `active_query`, `tenant_id` | dense (Pinecone) + per-tenant BM25 → RRF fusion → cross-encoder rerank → top-5 | `retrieved_chunks` | `retrieved N chunk(s)` |
 | `grade` (`nodes.py:57`) | `question`, `retrieved_chunks` | if none → empty; else LLM structured verdict → relevant indices | `relevant_chunks` | `graded N chunk(s); M relevant` |
 | `rewrite` (`nodes.py:76`) | `question`, `retry_count` | LLM reformulates a more searchable query; `retry_count += 1` | `active_query`, `retry_count` | `rewrote query (attempt N)` |
 | `answer` (`nodes.py:85`) | `question`, `relevant_chunks` | join context → generator; if it returns `NOT_IN_CORPUS` → deterministic decline | `answer`, `found_in_corpus` | `answered from N relevant chunk(s)` **or** `generator declined: …` |
@@ -143,9 +156,9 @@ AskResponse {
 ## 8. Talking points for the video
 
 - **Bounded self-correction loop** — one grade, at most one rewrite, then a deterministic terminal branch. The `retry_count` cap makes latency and cost predictable and prevents infinite retrieval.
-- **Retrieval is rerank-then-grade** — a cheap cross-encoder narrows 10 hybrid candidates to 5 before the (more expensive) LLM grader ever sees them.
+- **Retrieval is rerank-then-grade** — two separate retrievers (dense + per-tenant BM25) are fused by **Reciprocal Rank Fusion** into 10 candidates, a cheap cross-encoder narrows them to 5 before the (more expensive) LLM grader ever sees them.
 - **Two independent relevance gates** — the LLM **grader** decides whether chunks are relevant at all; the **generator sentinel** is a second gate that can still decline if the kept context is insufficient. Both must pass for `found_in_corpus = true`.
-- **Hybrid, then convex combination** — dense (semantic) and sparse (lexical BM25) are merged with `hybrid_convex_scale(alpha=0.5)`, a weighted sum — deliberately not true RRF.
+- **True RRF, not a weighted sum** — dense and BM25 scores live on incomparable scales (cosine-normed dense in `[-1,1]` vs unbounded BM25), so the pipeline never mixes raw scores. Each retriever contributes only a **rank**, and `1/(k + rank)` is summed across retrievers (`reciprocal_rank_fusion`, `fusion.py:7`). A chunk found by both retrievers wins over a chunk found by only one — this is where hybrid recall beyond a single hybrid query comes from.
 - **Isolation survives the whole graph** — `tenant_id` is injected once from the path and carried in state; every `retrieve` re-applies namespace + metadata filter, so no node can widen the search space.
 - **Grounding is enforced twice at the edges** — citations are emitted only when `found_in_corpus` is true, and the decline path returns a fixed message instead of improvised text.
-- **Testable by construction** — nodes are built around injected `grader`/`rewriter`/`generator`/`retriever` (`graph.py:16`), so the mocked decision-logic tests never touch a real LLM.
+- **Testable by construction** — nodes are built around injected `grader`/`rewriter`/`generator`/`retrieval_service` (`graph.py:15`), so the mocked decision-logic tests never touch a real LLM or vector store.

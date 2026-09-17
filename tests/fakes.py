@@ -27,49 +27,31 @@ def make_chunk(
     )
 
 
-class FakeStore:
-    """In-memory store recording every tenant-scoped query it receives.
+class FakeRetrievalService:
+    """In-memory retrieval stand-in recording every tenant-scoped query it receives.
 
-    ``hybrid_search`` only ever returns chunks belonging to the requested
-    tenant, mirroring the namespace + metadata-filter isolation the real store
-    performs against Pinecone.
+    ``retrieve`` only ever returns chunks belonging to the requested tenant,
+    mirroring the isolation the real service performs (Pinecone namespace +
+    metadata filter on the dense branch, a per-tenant BM25 corpus on the lexical
+    branch).
     """
 
-    def __init__(self, chunks_by_tenant: dict[str, list[Document]]) -> None:
+    def __init__(self, chunks_by_tenant: dict[str, list[Document]], top_k: int = 5) -> None:
         self.chunks_by_tenant = chunks_by_tenant
+        self.top_k = top_k
         self.queries: list[dict[str, Any]] = []
 
-    async def embed_query(self, query: str) -> list[float]:
-        return [1.0] * 4
-
-    def encode_query(self, text: str) -> dict[str, list]:
-        return {"indices": [0], "values": [1.0]}
-
-    async def hybrid_search(
-        self,
-        query_vector: list[float],
-        sparse_vector: dict[str, list],
-        tenant_id: str,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        self.queries.append({"tenant_id": tenant_id, "query": None})
+    async def retrieve(self, tenant_id: str, query: str) -> list[dict[str, Any]]:
+        self.queries.append({"tenant_id": tenant_id, "query": query})
         chunks = self.chunks_by_tenant.get(tenant_id, [])
         return [
             {
-                "id": chunk.metadata["doc_id"],
+                "id": f"{chunk.metadata['doc_id']}-{chunk.metadata['chunk_index']}",
                 "score": 1.0,
                 "payload": {**chunk.metadata, "text": chunk.page_content},
             }
-            for chunk in chunks[:limit]
+            for chunk in chunks[: self.top_k]
         ]
-
-
-class FakeRetriever:
-    def __init__(self, top_k: int = 5) -> None:
-        self.top_k = top_k
-
-    def rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return candidates[: self.top_k]
 
 
 class FakeLLMs:
@@ -106,13 +88,11 @@ class FakeLLMs:
 
 
 def build_test_graph(
-    store: FakeStore,
+    retrieval_service: FakeRetrievalService,
     llms: FakeLLMs,
-    retriever: FakeRetriever | None = None,
 ) -> Any:
     return build_ask_graph(
-        store,
-        retriever or FakeRetriever(),
+        retrieval_service,
         grader=llms.grader,
         rewriter=llms.rewriter,
         generator=llms.generator,

@@ -1,0 +1,62 @@
+{
+  "documents": [
+    {
+      "url": "https://asana.com/features/project-management/tasks",
+      "brand": "Asana",
+      "source": "https://asana.com/features/project-management/tasks"
+    },
+    {
+      "url": "https://asana.com/features/resource-management/workload",
+      "brand": "Asana",
+      "source": "https://asana.com/features/resource-management/workload"
+    },
+    {
+      "url": "https://asana.com/pricing",
+      "brand": "Asana",
+      "source": "https://asana.com/pricing"
+    },
+    {
+      "url": "https://trello.com/en/guide/trello-101",
+      "brand": "Trello",
+      "source": "https://trello.com/en/guide/trello-101"
+    },
+    {
+      "url": "https://trello.com/tour",
+      "brand": "Trello",
+      "source": "https://trello.com/tour"
+    }
+  ]
+}
+
+
+#### Globex
+
+{
+  "documents": [
+    {
+      "url": "https://monday.com/projects/features",
+      "brand": "monday.com",
+      "source": "https://monday.com/projects/features"
+    },
+    {
+      "url": "https://support.monday.com/hc/en-us/articles/360014437599-Project-management-with-monday-com",
+      "brand": "monday.com",
+      "source": "https://support.monday.com/hc/en-us/articles/360014437599-Project-management-with-monday-com"
+    },
+    {
+      "url": "https://clickup.com/features",
+      "brand": "ClickUp",
+      "source": "https://clickup.com/features"
+    },
+    {
+      "url": "https://clickup.com/teams/project-management",
+      "brand": "ClickUp",
+      "source": "https://clickup.com/teams/project-management"
+    },
+    {
+      "url": "https://help.clickup.com/hc/en-us/articles/9702941914007-ClickUp-for-project-management",
+      "brand": "ClickUp",
+      "source": "https://help.clickup.com/hc/en-us/articles/9702941914007-ClickUp-for-project-management"
+    }
+  ]
+}

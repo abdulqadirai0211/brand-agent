@@ -5,7 +5,7 @@ import pytest
 from app.graph.graph import build_ask_graph
 from app.graph.nodes import NOT_IN_CORPUS_ANSWER
 from app.llm.service import NOT_IN_CORPUS_SENTINEL
-from tests.fakes import FakeLLMs, FakeRetriever, FakeStore, build_test_graph, make_chunk
+from tests.fakes import FakeLLMs, FakeRetrievalService, build_test_graph, make_chunk
 
 ACME_CHUNKS = [
     make_chunk("Asana offers list and board views for project management.", "acme", "doc-a"),
@@ -42,7 +42,7 @@ def _trace_nodes(result: dict) -> list[str]:
 
 def test_relevant_on_first_pass_answers_without_rewrite() -> None:
     llms = FakeLLMs(relevant_by_call=[[0]])
-    graph = build_test_graph(FakeStore({"acme": ACME_CHUNKS}), llms)
+    graph = build_test_graph(FakeRetrievalService({"acme": ACME_CHUNKS}), llms)
 
     result = _run(graph)
 
@@ -58,7 +58,7 @@ def test_relevant_on_first_pass_answers_without_rewrite() -> None:
 
 def test_rewrites_once_then_answers() -> None:
     llms = FakeLLMs(relevant_by_call=[[], [0]])
-    graph = build_test_graph(FakeStore({"acme": ACME_CHUNKS}), llms)
+    graph = build_test_graph(FakeRetrievalService({"acme": ACME_CHUNKS}), llms)
 
     result = _run(graph, question="What does Asana do?")
 
@@ -79,7 +79,7 @@ def test_rewrites_once_then_answers() -> None:
 
 def test_never_relevant_retries_at_most_once_then_not_in_corpus() -> None:
     llms = FakeLLMs(relevant_by_call=[[], []])
-    graph = build_test_graph(FakeStore({"acme": ACME_CHUNKS}), llms)
+    graph = build_test_graph(FakeRetrievalService({"acme": ACME_CHUNKS}), llms)
 
     result = _run(graph, question="What does the yurt market look like?")
 
@@ -101,7 +101,7 @@ def test_never_relevant_retries_at_most_once_then_not_in_corpus() -> None:
 
 def test_generator_declining_context_marks_not_in_corpus() -> None:
     llms = FakeLLMs(relevant_by_call=[[0]], answer=NOT_IN_CORPUS_SENTINEL)
-    graph = build_test_graph(FakeStore({"acme": ACME_CHUNKS}), llms)
+    graph = build_test_graph(FakeRetrievalService({"acme": ACME_CHUNKS}), llms)
 
     result = _run(graph)
 
@@ -114,7 +114,7 @@ def test_generator_declining_context_marks_not_in_corpus() -> None:
 
 def test_empty_corpus_short_circuits_grading() -> None:
     llms = FakeLLMs(relevant_by_call=[[0]])
-    graph = build_test_graph(FakeStore({"acme": []}), llms)
+    graph = build_test_graph(FakeRetrievalService({"acme": []}), llms)
 
     result = _run(graph, question="Anything here?")
 
@@ -127,8 +127,7 @@ def test_empty_corpus_short_circuits_grading() -> None:
 def test_graph_build_accepts_injected_fakes_without_touching_real_llm() -> None:
     llms = FakeLLMs(relevant_by_call=[[0]])
     graph = build_ask_graph(
-        FakeStore({"acme": ACME_CHUNKS}),
-        FakeRetriever(),
+        FakeRetrievalService({"acme": ACME_CHUNKS}),
         grader=llms.grader,
         rewriter=llms.rewriter,
         generator=llms.generator,

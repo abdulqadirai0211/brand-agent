@@ -21,3 +21,4 @@ langgraph
 grandalf
 pytest
 pytest-asyncio
+rank_bm25

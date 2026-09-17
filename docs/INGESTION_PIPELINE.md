@@ -12,7 +12,9 @@ Here's the ingestion pipeline, drawn from the actual code. Use the top diagram a
                      Pydantic IngestRequest  (url XOR text; brand required)
                                         │
                      Depends(get_ingestion)  → singleton IngestionService
-                     dependencies.py:21      → service.persist = store.persist_chunks
+                     dependencies.py:21      → persist = store.persist_chunks  ─WHICH ALSO─
+                                              → feeds the same chunks into the per-tenant
+                                                BM25Index (ask-path lexical branch)
                                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │ ORCHESTRATION   IngestionService.run(tenant_id, documents)  service.py:43      │
@@ -81,7 +83,7 @@ Here's the ingestion pipeline, drawn from the actual code. Use the top diagram a
 - **Idempotent by construction** — `doc_id = sha256(url)` (or sha256 of text), and the vector id is `{doc_id}-{chunk_index}` (`document_id.py:8`, `pinecone.py:135`). Re-ingesting the same doc overwrites the same ids rather than duplicating.
 - **Per-document fault isolation** — each doc is processed in its own `try/except` (`service.py:60-67`); one bad URL doesn't abort the batch. Errors are collected, never raised.
 - **Tenant routing happens at the write boundary** — `tenant_id` comes only from the URL path (`ingest.py:21`), is stamped into every chunk's metadata (`document_chunker.py:41`), and is the namespace used by `upsert` (`pinecone.py:143`). This is the same key the query path filters on.
-- **Dual representation** — each chunk is stored as both a dense vector (semantic, normalized) and a sparse vector (lexical TF, hashed term ids), which is what enables hybrid search at query time.
+- **Dual representation** — each chunk is stored as both a dense vector (semantic, normalized) and a sparse vector (lexical TF, hashed term ids). Dense powers the query-time Pinecone search; the lexical branch is a **per-tenant in-memory `rank_bm25` index** that ingest feeds directly (and that is rehydrated from Pinecone at startup), so a fresh process answers correctly without waiting for new ingests.
 - **Sync libraries kept off the event loop** — the web fetch, embedding client, and sparse encoding all run via `asyncio.to_thread` (`service.py:107`, `pinecone.py:119,123`).
 
 ## 4. Error taxonomy (per-document `errors[]`)
