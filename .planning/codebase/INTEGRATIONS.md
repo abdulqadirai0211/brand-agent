@@ -35,7 +35,7 @@
   - `dense`: `VectorParams(size=1024, distance=COSINE)` (embeddings from `qwen3-embedding:4b` at 1024 dims; experiment used 1536 OpenAI dims — migrated to Ollama)
   - `sparse`: `SparseVectorParams(modifier=Modifier.IDF)` for BM25 lexical retrieval
   - Payload index: `create_payload_index(field_name="metadata.tenant_id", field_schema=PayloadSchemaType.KEYWORD)` — tenant isolation enforced in-vectorstore, never post-filter (spec §11)
-  - Point payload: `tenant_id`, `doc_id`, `chunk_index`, `source`, `brand`, `heading_path`, `text`
+  - Point payload: `tenant_id`, `doc_id`, `chunk_index`, `source`, `brand`, `text`
 - Operations required: `ensure_collection`, `upsert_chunks`, `delete_document`, `dense_search`, `sparse_search`, `hybrid_search` (spec §11; `app/vectorstore/qdrant.py` empty stub)
 
 **File Storage:** None. Only in-memory/local (Qdrant memory mode in tests).

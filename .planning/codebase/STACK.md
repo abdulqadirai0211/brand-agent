@@ -25,7 +25,7 @@
 **Core:**
 - FastAPI — REST framework (declared in `requirements.txt`; NOT yet installed in venv; planned app composition in `app/main.py` + routers in `app/api/routes/{health,ingest,ask}.py`, all currently empty stubs)
 - Pydantic v2 / Pydantic Settings — config + schemas (`app/config.py` implemented, `app/api/schemas.py` empty stub)
-- LangChain — `langchain-text-splitters` for chunking (`app/chunking/chunker.py` stub; real usage pattern in `experiment2.ipynb` cell using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter`), `langchain-ollama` for embeddings (`app/embeddings/service.py` stub)
+- LangChain — `langchain-text-splitters` for chunking (`app/chunking/chunker.py`: `RecursiveCharacterTextSplitter` with `length_function=len`), `langchain-ollama` for embeddings (`app/embeddings/service.py` stub)
 - LangGraph — planned QA agent graph (`app/graph/{state,nodes,edges,graph}.py`, all empty stubs; package not yet in requirements.txt — spec `brand_qa_agent_file_spec.md` §24 lists it as required)
 
 **Testing:**

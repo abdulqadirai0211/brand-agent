@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    image: brand-qa-agent:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Embeddings run on the host's Ollama. On Docker Desktop (macOS/Windows)
+      # host.docker.internal reaches it directly; on Linux, Ollama must also be
+      # started with OLLAMA_HOST=0.0.0.0 for this to work.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

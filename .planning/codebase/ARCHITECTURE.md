@@ -94,7 +94,7 @@ External services: Firecrawl (extraction, ✅ wired), Ollama `qwen3-embedding:4b
 
 **Preprocessing / Chunking / Embeddings (⬜ stubs):**
 - `app/preprocessing/` — normalize content (cleaner), preserve Markdown heading context (markdown_parser), validate before ingest (validator)
-- `app/chunking/chunker.py` — two-stage: `MarkdownHeaderTextSplitter` → `RecursiveCharacterTextSplitter` (~400 tokens, 50 overlap), Qwen3 tokenizer for sizing (spec §9)
+- `app/chunking/chunker.py` — single-stage `RecursiveCharacterTextSplitter` (~400 chars, 50 overlap), builtin `len` as `length_function`, no tokenizer dependency (spec §9)
 - `app/embeddings/service.py` — `langchain_ollama.OllamaEmbeddings(model="qwen3-embedding:4b", base_url=..., dimensions=1024)` with separate query/document methods (spec §10)
 
 **Vector Store / Retrieval (⬜ stubs):**
@@ -124,7 +124,7 @@ Per spec §7/§28:
 2. `IngestionService` validates each doc — at least one of `url`/`text`, `brand` required (`app/ingestion/service.py` ⬜)
 3. Deterministic `doc_id`: `SHA-256(canonical URL)` or `SHA-256(normalized text)` (spec §7)
 4. URL extraction via `WebExtractor`: ✅ `FirecrawlExtractor.extract()` → `ExtractedDocument` (`app/ingestion/extractors/firecrawl.py:73`, SSRF guard at `app/ingestion/extractor.py:84`)
-5. Clean → parse Markdown (heading_path) → chunk (vector ID `{doc_id}-{chunk_index}`) → embed (1024-d) → upsert with tenant-scoped payload (spec §29)
+5. Clean → chunk (vector ID `{doc_id}-{chunk_index}`) → embed (1024-d) → upsert with tenant-scoped payload (spec §29)
 6. Response `{documents_stored, chunks_stored}`; re-ingest keeps counts flat (idempotent)
 
 ### QA Ask Flow (intended; graph is a stub)

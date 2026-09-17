@@ -1,0 +1,16 @@
+venv/
+.git/
+.gitignore
+.dockerignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.env.local
+data/
+.planning/
+*.ipynb
+*.pdf
+brand_qa_agent_file_spec.md
+folder_structure.md

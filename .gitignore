@@ -1,1 +1,8 @@
-venv
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+data/
+.mypy_cache/
+.pytest_cache/
